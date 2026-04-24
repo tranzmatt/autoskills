@@ -153,10 +153,21 @@ function getInstallRegistryDir(opts: InstallOptions): string {
   return opts.registryDir || getRegistryDir();
 }
 
+export function getAutoskillsCacheDir(): string {
+  return (
+    process.env.AUTOSKILLS_CACHE_DIR || join(homedir(), ".cache", "autoskills", "skills-registry")
+  );
+}
+
+export function clearAutoskillsCache(): { cacheDir: string; removed: boolean } {
+  const cacheDir = getAutoskillsCacheDir();
+  const removed = existsSync(cacheDir);
+  rmSync(cacheDir, { recursive: true, force: true });
+  return { cacheDir, removed };
+}
+
 function getCacheRegistryDir(entry: RegistryEntry): string {
-  const base =
-    process.env.AUTOSKILLS_CACHE_DIR || join(homedir(), ".cache", "autoskills", "skills-registry");
-  return join(base, entry.bundleHash);
+  return join(getAutoskillsCacheDir(), entry.bundleHash);
 }
 
 function encodeRawPath(skillName: string, rel: string): string {
