@@ -20,6 +20,8 @@ import {
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
+import { createInterface } from "node:readline/promises";
+import { stdin, stdout } from "node:process";
 import { fileURLToPath } from "node:url";
 import { pipeline } from "node:stream/promises";
 
@@ -118,7 +120,10 @@ function collectRetryFailedSkillNames() {
     if (skill) retry.add(getSkillName(skill));
   };
 
-  for (const entry of report.flagged || []) add(entry);
+  for (const entry of report.flagged || []) {
+    if (entry?.accepted) continue;
+    add(entry);
+  }
   for (const entry of report.rejected || []) add(entry);
   for (const entry of report.missing || []) add(entry);
   for (const entry of report.errors || []) add(entry);
@@ -549,6 +554,112 @@ function saveManifest(manifest) {
   writeFileSync(MANIFEST_PATH, JSON.stringify(manifest, null, 2) + "\n");
 }
 
+function writeSkillToRegistry(manifest, skill) {
+  const destDir = join(REGISTRY_DIR, skill.skillName);
+  rmSync(destDir, { recursive: true, force: true });
+  for (const f of skill.relFiles) {
+    const out = join(destDir, f.rel);
+    mkdirSync(dirname(out), { recursive: true });
+    writeFileSync(out, f.buf);
+  }
+
+  manifest.skills[skill.skillName] = {
+    source: skill.repo,
+    skillPath: skill.full,
+    commitSha: skill.sha,
+    files: skill.relFiles.map((f) => f.rel),
+    sha256: skill.shaMap,
+    bundleHash: skill.bundleHash,
+    review: {
+      status: skill.review.status,
+      flags: skill.review.flags,
+      summary: skill.review.summary,
+      model: REVIEW_MODEL,
+      promptVersion: REVIEW_PROMPT_VERSION,
+      reviewedAt: new Date().toISOString(),
+    },
+  };
+}
+
+function recordFlagged(report, skill, accepted) {
+  report.totals.flagged++;
+  report.flagged.push({
+    skill: skill.full,
+    flags: skill.review.flags,
+    summary: skill.review.summary,
+    accepted,
+  });
+}
+
+function printFlaggedDetails(skill) {
+  log();
+  log(yellow(`⚠ ${skill.skillName}`) + dim(` — ${skill.full}`));
+  log(`   ${bold("Problem:")} ${skill.review.summary}`);
+  if (skill.review.flags.length > 0) {
+    log(`   ${bold("Flags:")}`);
+    for (const flag of skill.review.flags) log(`   - ${flag}`);
+  } else {
+    log(`   ${bold("Flags:")} ${dim("auditor did not provide specific flags")}`);
+  }
+}
+
+function printReviewedContent(skill) {
+  log();
+  log(bold(`Reviewed content for ${skill.skillName}`));
+
+  if (skill.textFilesForReview.length === 0) {
+    log(dim("   No markdown or text files were included in the review."));
+    return;
+  }
+
+  for (const file of skill.textFilesForReview) {
+    log();
+    log(cyan(`--- ${file.rel} ---`));
+    log(file.content);
+    log(cyan(`--- end ${file.rel} ---`));
+  }
+}
+
+async function reviewFlaggedSkills(pendingFlagged, report, manifest) {
+  if (pendingFlagged.length === 0) return;
+
+  log();
+  log(bold("Flagged skills review"));
+  log(dim("   Review each auditor finding before deciding whether to write it to the registry."));
+
+  if (!stdin.isTTY || !stdout.isTTY) {
+    log(yellow("   Non-interactive terminal: flagged skills were not written."));
+    for (const skill of pendingFlagged) {
+      printFlaggedDetails(skill);
+      recordFlagged(report, skill, false);
+    }
+    return;
+  }
+
+  const rl = createInterface({ input: stdin, output: stdout });
+  try {
+    for (const skill of pendingFlagged) {
+      printFlaggedDetails(skill);
+      const showContent = await rl.question(`   Show reviewed content? [y/N] `);
+      if (/^(y|yes|s|si|sí)$/i.test(showContent.trim())) {
+        printReviewedContent(skill);
+      }
+
+      const answer = await rl.question(`   Add ${skill.skillName} anyway? [Y/n] `);
+      const accepted = !/^(n|no)$/i.test(answer.trim());
+      if (accepted) {
+        writeSkillToRegistry(manifest, skill);
+        log(green(`   ✔ ${skill.skillName}`) + dim(` — flagged, accepted by maintainer`));
+      } else {
+        log(dim(`   · ${skill.skillName} — skipped`));
+      }
+      recordFlagged(report, skill, accepted);
+    }
+  } finally {
+    rl.close();
+  }
+}
+
 function getManifestRepoSha(manifest, repo, skills) {
   const shas = new Set();
   for (const s of skills) {
@@ -598,6 +709,7 @@ async function main() {
     missing: [],
     errors: [],
   };
+  const pendingFlagged = [];
 
   for (const [repo, skills] of byRepo) {
     log(bold(repo) + dim(` (${skills.length} skill${skills.length === 1 ? "" : "s"})`));
@@ -713,10 +825,25 @@ async function main() {
         continue;
       }
 
+      const skillToWrite = {
+        repo,
+        full,
+        skillName,
+        sha,
+        relFiles,
+        shaMap,
+        bundleHash,
+        review,
+        textFilesForReview,
+      };
+
       if (review.status === "flagged" && !FLAGS.force) {
         log(yellow(`   ⚠ ${skillName}`) + dim(` — flagged: ${review.summary}`));
-        report.totals.flagged++;
-        report.flagged.push({ skill: full, flags: review.flags, summary: review.summary });
+        if (FLAGS.dryRun) {
+          recordFlagged(report, skillToWrite, false);
+        } else {
+          pendingFlagged.push(skillToWrite);
+        }
         continue;
       }
 
@@ -727,30 +854,7 @@ async function main() {
         continue;
       }
 
-      const destDir = join(REGISTRY_DIR, skillName);
-      rmSync(destDir, { recursive: true, force: true });
-      for (const f of relFiles) {
-        const out = join(destDir, f.rel);
-        mkdirSync(dirname(out), { recursive: true });
-        writeFileSync(out, f.buf);
-      }
-
-      manifest.skills[skillName] = {
-        source: repo,
-        skillPath: full,
-        commitSha: sha,
-        files: relFiles.map((f) => f.rel),
-        sha256: shaMap,
-        bundleHash,
-        review: {
-          status: review.status,
-          flags: review.flags,
-          summary: review.summary,
-          model: REVIEW_MODEL,
-          promptVersion: REVIEW_PROMPT_VERSION,
-          reviewedAt: new Date().toISOString(),
-        },
-      };
+      writeSkillToRegistry(manifest, skillToWrite);
 
       log(green(`   ✔ ${skillName}`) + dim(` — ${review.status}, ${relFiles.length} file(s)`));
       if (review.status === "flagged") report.totals.flagged++;
@@ -759,6 +863,8 @@ async function main() {
 
     rmSync(tmpDir, { recursive: true, force: true });
   }
+
+  await reviewFlaggedSkills(pendingFlagged, report, manifest);
 
   if (!FLAGS.dryRun) {
     manifest.generatedAt = new Date().toISOString();
